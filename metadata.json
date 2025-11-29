@@ -1,0 +1,8 @@
+{
+  "name": "發票大師 - Taiwan Receipt Lottery",
+  "description": "A smart Taiwan Invoice Lottery checker featuring manual quick-check and AI-powered receipt scanning to instantly identify winning numbers.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}

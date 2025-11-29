@@ -1,0 +1,39 @@
+name: Update Lottery Numbers
+
+on:
+  schedule:
+    # 台灣時間單數月 25 日 14:00 (UTC 06:00)
+    # Cron: 分 時 日 月 星期
+    - cron: '0 6 25 1,3,5,7,9,11 *'
+  workflow_dispatch: # 允許手動按按鈕觸發
+
+permissions:
+  contents: write # 允許寫入 Repository
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        # 這裡不需要 npm install，因為我們的腳本只用原生模組
+        # 如果未來加了 axios，這裡需要 npm ci
+        run: echo "No dependencies to install"
+
+      - name: Run update script
+        env:
+          INVOICE_APP_ID: ${{ secrets.INVOICE_APP_ID }}
+        run: node scripts/update-lottery.mjs
+
+      - name: Commit and Push changes
+        uses: stefanzweifel/git-auto-commit-action@v4
+        with:
+          commit_message: "🤖 Auto-update lottery numbers [skip ci]"
+          file_pattern: "public/lottery-data.json"
