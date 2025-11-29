@@ -15,7 +15,7 @@ const CLOUD_DATA_URL = "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REP
 export const fetchWinningNumbersFromCloud = async (): Promise<WinningNumbers[] | null> => {
   console.log("[LotteryService] Checking for cloud updates...");
   try {
-    const response = await fetch(CLOUD_DATA_URL + "?t=" + new Date().getTime()); // Add timestamp to prevent caching
+    const response = await fetch(https://up2you.github.io/lottery/lottery-data.json + "?t=" + new Date().getTime()); // Add timestamp to prevent caching
     if (!response.ok) {
        console.warn("Cloud data not found or accessible.");
        return null;
