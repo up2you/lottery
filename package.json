@@ -10,12 +10,24 @@
     "update-lottery": "node scripts/update-lottery.mjs"
   },
   "dependencies": {
-    "@google/genai": "^0.1.1",
+    "@capacitor/android": "latest",
+    "@capacitor/core": "latest",
+    "@capacitor-community/speech-recognition": "^5.0.0",
+    "@google/genai": "latest",
+    "jsqr": "^1.4.0",
     "lucide-react": "^0.263.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-scripts": "5.0.1",
-    "web-vitals": "^2.1.4"
+    "web-vitals": "^2.1.4",
+    "typescript": "^4.9.5",
+    "@types/node": "^16.18.101",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@types/jest": "^29.5.12"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "latest"
   },
   "browserslist": {
     "production": [

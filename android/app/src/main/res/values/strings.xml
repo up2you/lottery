@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">發票大師</string>
+    <string name="title_activity_main">發票大師</string>
+    <string name="package_name">com.example.invoice</string>
+    <string name="custom_url_scheme">com.example.invoice</string>
+</resources>

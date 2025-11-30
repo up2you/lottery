@@ -1,5 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Camera, Share2, RefreshCw, ChevronLeft, Award, Delete, Calendar, Layers, Mic, MicOff, X, Image as ImageIcon, Clock, PlusCircle, AlertCircle, CheckCircle2 } from 'lucide-react';
+import jsQR from 'jsqr';
+import { SpeechRecognition } from '@capacitor-community/speech-recognition';
 import { WinningNumbers, CheckResult, WinningRecord, PendingReceipt } from './types';
 import { checkLotteryNumber, quickCheck3Digits } from './utils/lotteryLogic';
 import { WINNING_NUMBERS_DATA } from './constants';
@@ -19,7 +21,6 @@ const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>(Tab.Checker);
   
   // Data State
-  // We use a state for the source of truth now, initialized with the static constant
   const [allLotteryData, setAllLotteryData] = useState<WinningNumbers[]>(WINNING_NUMBERS_DATA);
 
   // periodIndex: -1 indicates "Check All (4 Months)", otherwise index in allLotteryData
@@ -43,11 +44,10 @@ const App: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const animationFrameRef = useRef<number>(0);
 
   // Speech Recognition State
   const [isListening, setIsListening] = useState(false);
-  const isListeningRef = useRef(isListening); // To track state inside callbacks
-  const recognitionRef = useRef<any>(null);
 
   // History & Pending State
   const [history, setHistory] = useState<WinningRecord[]>([]);
@@ -62,7 +62,43 @@ const App: React.FC = () => {
   // Track if we have already alerted about pending wins to avoid spamming on every render
   const hasAlertedPendingWins = useRef(false);
 
+  // Audio Context for Beep Sound
+  const audioContextRef = useRef<AudioContext | null>(null);
+
   // --- Initialization Effects ---
+
+  // Initialize Audio Context
+  useEffect(() => {
+    const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+    if (AudioContext) {
+        audioContextRef.current = new AudioContext();
+    }
+  }, []);
+
+  const playBeep = (freq = 800, type: OscillatorType = 'sine', duration = 0.1) => {
+    if (!audioContextRef.current) return;
+    try {
+        const ctx = audioContextRef.current;
+        if (ctx.state === 'suspended') ctx.resume();
+        
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, ctx.currentTime);
+        
+        gain.gain.setValueAtTime(0.1, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+        
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        
+        osc.start();
+        osc.stop(ctx.currentTime + duration);
+    } catch(e) {
+        console.error("Audio play failed", e);
+    }
+  };
 
   // 1. Load LocalStorage Data
   useEffect(() => {
@@ -99,7 +135,6 @@ const App: React.FC = () => {
   // Update winning numbers when period index changes or data updates
   useEffect(() => {
     if (periodIndex === -1) {
-      // Keep displaying the latest numbers in background or just use the first one for safety
       if (allLotteryData.length > 0) {
           setWinningNumbers(allLotteryData[0]);
       }
@@ -115,7 +150,6 @@ const App: React.FC = () => {
   // --- Check Pending Wins on Data Update ---
   useEffect(() => {
     if (allLotteryData.length > 0 && pendingReceipts.length > 0 && !hasAlertedPendingWins.current) {
-        // Find pending receipts that match the NEW data
         const winners = pendingReceipts.filter(r => {
             const officialData = allLotteryData.find(d => d.period === r.period);
             if (officialData) {
@@ -128,10 +162,8 @@ const App: React.FC = () => {
         if (winners.length > 0) {
             hasAlertedPendingWins.current = true;
             const winningNumbersStr = winners.map(w => w.number).join(', ');
-            // Use setTimeout to allow UI to settle
             setTimeout(() => {
                 alert(`🎉 注意！您的預存發票中有疑似中獎號碼：\n\n${winningNumbersStr}\n\n請前往「紀錄」頁面核對！`);
-                // Optionally switch to History tab
                 setActiveTab(Tab.History);
                 setHistorySubTab('pending');
             }, 1500);
@@ -143,11 +175,7 @@ const App: React.FC = () => {
   useEffect(() => {
     // 1. Stop Camera when leaving Scanner tab
     if (activeTab !== Tab.Scanner) {
-        if (streamRef.current) {
-            streamRef.current.getTracks().forEach(track => track.stop());
-            streamRef.current = null;
-        }
-        setIsCameraOpen(false);
+        stopCamera();
     }
     
     // 2. Stop Voice Playback immediately
@@ -155,22 +183,15 @@ const App: React.FC = () => {
         window.speechSynthesis.cancel();
     }
 
-    // 3. Stop Voice Recognition (Microphone) to save battery/privacy
-    // Only stop if we are NOT in Checker tab (since voice input is for Checker)
-    if (activeTab !== Tab.Checker && isListeningRef.current) {
-        if (recognitionRef.current) {
-            try {
-                recognitionRef.current.stop();
-            } catch(e) {}
-        }
+    // 3. Stop Voice Recognition (Microphone)
+    if (activeTab !== Tab.Checker && isListening) {
+        SpeechRecognition.stop();
         setIsListening(false);
     }
   }, [activeTab]);
 
 
-  // Generate next 2 periods based on current latest
   const generateNextPeriods = (currentPeriodStr: string): string[] => {
-    // Expected format: "113年 09-10月"
     try {
       const yearMatch = currentPeriodStr.match(/(\d+)年/);
       const monthMatch = currentPeriodStr.match(/(\d+)-(\d+)月/);
@@ -198,14 +219,12 @@ const App: React.FC = () => {
     }
   };
 
-  // Handle Data Refresh
   const handleRefresh = async () => {
     if (isRefreshing) return;
     setIsRefreshing(true);
-    hasAlertedPendingWins.current = false; // Allow alert again on manual refresh
+    hasAlertedPendingWins.current = false; 
     
     try {
-        // 1. Try Cloud Fetch First (Global Update)
         const cloudData = await fetchWinningNumbersFromCloud();
         if (cloudData && cloudData.length > 0) {
             setAllLotteryData(cloudData);
@@ -213,17 +232,12 @@ const App: React.FC = () => {
             setFuturePeriods(generateNextPeriods(cloudData[0].period));
             alert("已從雲端同步最新號碼！");
         } else {
-            // 2. Fallback to specific API fetch if cloud fails (e.g. for development testing with AppID)
             const appId = localStorage.getItem('appId');
             if (appId) {
-                // Convert current period string to API term format (e.g. 113年 09-10月 -> 11310)
-                // This logic tries to fetch the *current* period again to check for updates
-                const term = "11310"; // Hardcoded for demo, logic exists in update-lottery.mjs
+                const term = "11310"; 
                 const apiData = await fetchWinningNumbersFromAPI(term, appId);
                 if (apiData) {
-                    // Update the first item in our list
                     const newData = [...allLotteryData];
-                    // Check if exists
                     const idx = newData.findIndex(d => d.period === apiData.period);
                     if (idx >= 0) {
                         newData[idx] = apiData;
@@ -233,7 +247,7 @@ const App: React.FC = () => {
                     setAllLotteryData(newData);
                     alert("已透過 API 更新當期資料");
                 } else {
-                    alert("目前已是最新資料 (雲端/API 無新資料)");
+                    alert("目前已是最新資料");
                 }
             } else {
                 alert("已檢查雲端更新 (無新資料)");
@@ -247,41 +261,34 @@ const App: React.FC = () => {
     }
   };
 
-  // Voice Feedback Helper
   const speakResult = (message: string) => {
     if ('speechSynthesis' in window) {
-      // Cancel any ongoing speech
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(message);
       utterance.lang = 'zh-TW';
-      utterance.rate = 1.2; // Slightly faster
+      utterance.rate = 1.2;
       window.speechSynthesis.speak(utterance);
     }
   };
 
-  // --- Voice Recognition Logic ---
+  // --- Voice Recognition Logic (Native Plugin) ---
   
-  // 1. Initialize Recognition Instance Once
   useEffect(() => {
-    if (typeof window !== 'undefined' && ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
-        const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-        const recognition = new SpeechRecognition();
-        recognition.continuous = true;
-        recognition.interimResults = false;
-        recognition.lang = 'cmn-Hant-TW'; // Traditional Chinese (Taiwan)
-
-        recognition.onresult = (event: any) => {
-            const lastResultIndex = event.results.length - 1;
-            const transcript = event.results[lastResultIndex][0].transcript;
-            console.log('Voice Input:', transcript);
+    // Listener for partial results from native plugin
+    SpeechRecognition.removeAllListeners();
+    
+    SpeechRecognition.addListener('partialResults', (data: any) => {
+        if (data.matches && data.matches.length > 0) {
+            const rawText = data.matches[0];
+            const digits = normalizeToDigits(rawText);
             
-            const digits = normalizeToDigits(transcript);
             if (digits) {
                 setQuickInput(prev => {
                     let newVal = prev;
                     for (const char of digits) {
+                        playBeep(1200, 'square', 0.05); // Beep on voice input
                         if (newVal.length >= 3) {
-                            newVal = char; // Auto reset start new
+                            newVal = char; 
                         } else {
                             newVal += char;
                         }
@@ -289,56 +296,44 @@ const App: React.FC = () => {
                     return newVal;
                 });
             }
-        };
+        }
+    });
 
-        recognition.onerror = (event: any) => {
-            console.error('Speech recognition error', event.error);
-            if (event.error === 'not-allowed') {
-                setIsListening(false);
-            }
-        };
-
-        recognition.onend = () => {
-            if (isListeningRef.current) {
-                try {
-                    recognition.start();
-                } catch (e) {
-                    console.log("Restart failed", e);
-                }
-            }
-        };
-
-        recognitionRef.current = recognition;
-    }
+    return () => {
+        SpeechRecognition.removeAllListeners();
+    };
   }, []);
 
-  // 2. Handle Start/Stop based on State
-  useEffect(() => {
-      isListeningRef.current = isListening;
-      
-      if (!recognitionRef.current) return;
-
-      if (isListening) {
-          try {
-              recognitionRef.current.start();
-          } catch (e) {
-              // Already started or busy
-          }
-      } else {
-          try {
-              recognitionRef.current.stop();
-          } catch (e) {
-              // Already stopped
-          }
-      }
-  }, [isListening]);
-
-  const toggleListening = () => {
-      if (!recognitionRef.current) {
-          alert("您的瀏覽器不支援語音辨識功能");
+  const toggleListening = async () => {
+      const { available } = await SpeechRecognition.available();
+      if (!available) {
+          alert("此裝置不支援語音輸入功能");
           return;
       }
-      setIsListening(!isListening);
+
+      if (isListening) {
+          await SpeechRecognition.stop();
+          setIsListening(false);
+      } else {
+          try {
+              // Request permission first
+              await SpeechRecognition.requestPermissions();
+              setIsListening(true);
+              
+              // Start listening
+              await SpeechRecognition.start({
+                  language: "zh-TW",
+                  maxResults: 1,
+                  prompt: "請唸出號碼...",
+                  partialResults: true,
+                  popup: false,
+              });
+          } catch (e) {
+              console.error("Voice start failed", e);
+              setIsListening(false);
+              alert("語音啟動失敗，請檢查權限");
+          }
+      }
   };
 
   const normalizeToDigits = (text: string): string => {
@@ -361,21 +356,18 @@ const App: React.FC = () => {
   };
 
 
-  // Quick Check Logic & Side Effects
+  // Quick Check Logic
   useEffect(() => {
     if (quickInput.length === 3) {
       let result = { potential: false, message: "沒中" };
 
       if (periodIndex === -1) {
-        // Check ALL periods available in allLotteryData
         const results = allLotteryData.map(data => quickCheck3Digits(quickInput, data));
-        // If any period has a potential win, we consider it a win
         const match = results.find(r => r.potential);
         if (match) {
           result = { potential: true, message: "注意中獎 (請核對期別)" };
         }
       } else {
-        // Check single period
         result = quickCheck3Digits(quickInput, winningNumbers);
       }
 
@@ -383,8 +375,10 @@ const App: React.FC = () => {
       
       // TTS Logic
       if (result.potential) {
+        playBeep(1000, 'sine', 0.2); // Success beep
         speakResult("注意中獎");
       } else {
+        playBeep(300, 'sawtooth', 0.2); // Fail beep
         speakResult("沒中");
       }
     } else {
@@ -394,99 +388,65 @@ const App: React.FC = () => {
 
   // Handle number pad input
   const handlePadInput = (value: string) => {
+    playBeep(); // Keypad sound
     if (value === 'back') {
       setQuickInput(prev => prev.slice(0, -1));
       return;
     } 
 
-    // Logic for Auto-Reset on 4th digit
     if (quickInput.length === 3) {
-      // If we already have 3 digits, the next number starts a NEW entry
       setQuickInput(value);
-      // Check logic will run automatically via useEffect when length becomes 3 again later
     } else {
-      // Normal append
       setQuickInput(prev => prev + value);
     }
   };
 
-  // --- Image Processing & Camera Logic ---
+  // --- QR Code & Camera Logic ---
+  
+  const tickCamera = () => {
+      if (videoRef.current && canvasRef.current && isCameraOpen) {
+          const video = videoRef.current;
+          const canvas = canvasRef.current;
+          
+          if (video.readyState === video.HAVE_ENOUGH_DATA) {
+              canvas.width = video.videoWidth;
+              canvas.height = video.videoHeight;
+              const ctx = canvas.getContext("2d", { willReadFrequently: true });
+              if (ctx) {
+                  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                  
+                  // QR Scan
+                  const code = jsQR(imageData.data, imageData.width, imageData.height, {
+                      inversionAttempts: "dontInvert",
+                  });
 
-  const processImageAnalysis = async (base64Data: string) => {
-    setIsProcessing(true);
-    setScanResult(null);
-    setScannedNumber("");
-
-    try {
-      const result = await geminiService.parseReceiptImage(base64Data);
-      
-      if (result && result.number) {
-        setScannedNumber(result.number);
-        
-        let prizeResult: CheckResult;
-        if (periodIndex === -1) {
-             const results = allLotteryData.map(data => checkLotteryNumber(result.number, data));
-             const winner = results.find(r => r.isWinner);
-             prizeResult = winner || results[0];
-        } else {
-             prizeResult = checkLotteryNumber(result.number, winningNumbers);
-        }
-        
-        setScanResult(prizeResult);
-
-        // Voice Feedback for Scan Result
-        if (prizeResult.isWinner) {
-            speakResult(`恭喜中獎，${prizeResult.prizeType}`);
-            addRecord(prizeResult, result.number);
-        } else {
-            speakResult("可惜沒中");
-        }
-
-      } else {
-        alert("無法辨識發票號碼，請確認圖片清晰度。");
+                  if (code && code.data) {
+                      const matched = code.data.match(/[A-Z]{2}(\d{8})/);
+                      if (matched && matched[1]) {
+                          const num = matched[1];
+                          // Only update if different to avoid spam
+                          if (num !== scannedNumber) {
+                              playBeep(1500, 'square', 0.1); // Scan success sound
+                              handleManualFullCheck(num);
+                          }
+                      }
+                  }
+              }
+          }
+          animationFrameRef.current = requestAnimationFrame(tickCamera);
       }
-    } catch (error) {
-      console.error("Scanning failed", error);
-      alert("掃描失敗，請稍後再試。");
-    } finally {
-      setIsProcessing(false);
-    }
   };
 
-  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
 
-    try {
-      const base64 = await fileToBase64(file);
-      const base64Data = base64.split(',')[1]; 
-      await processImageAnalysis(base64Data);
-    } catch (error) {
-      console.error("File processing failed", error);
-      alert("檔案處理失敗");
-    } finally {
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    }
-  };
-
-  const fileToBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.readAsDataURL(file);
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = error => reject(error);
-    });
-  };
-
-  // Camera Functions
   const startCamera = async () => {
     setIsCameraOpen(true);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: 'environment',
-          width: { ideal: 1920 },
-          height: { ideal: 1080 }
+          width: { ideal: 1280 }, // Lower resolution for better performance
+          height: { ideal: 720 }
         }
       });
       
@@ -496,8 +456,9 @@ const App: React.FC = () => {
         videoRef.current.srcObject = stream;
         videoRef.current.onloadedmetadata = async () => {
            videoRef.current?.play();
-           
-           // AUTO-FOCUS Implementation
+           animationFrameRef.current = requestAnimationFrame(tickCamera); // Start scanning loop
+
+           // AUTO-FOCUS
            const track = stream.getVideoTracks()[0];
            const capabilities = (track.getCapabilities && track.getCapabilities()) as any;
            
@@ -506,21 +467,21 @@ const App: React.FC = () => {
                await track.applyConstraints({
                  advanced: [{ focusMode: 'continuous' } as any]
                });
-               console.log("Continuous auto-focus enabled");
-             } catch (err) {
-               console.warn("Failed to apply focus constraint", err);
-             }
+             } catch (err) {}
            }
         };
       }
     } catch (err) {
       console.error("Camera start failed", err);
-      alert("無法啟動相機，請確認權限或改用上傳圖片功能。");
+      alert("無法啟動相機");
       setIsCameraOpen(false);
     }
   };
 
   const stopCamera = () => {
+    if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+    }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
@@ -539,17 +500,63 @@ const App: React.FC = () => {
       const ctx = canvas.getContext('2d');
       if (ctx) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const base64 = canvas.toDataURL('image/jpeg', 0.9);
+        const base64 = canvas.toDataURL('image/jpeg', 0.8);
         const base64Data = base64.split(',')[1];
         
-        stopCamera();
+        // Don't stop camera, let user take multiple if needed
         processImageAnalysis(base64Data);
       }
     }
   };
+  
+  const processImageAnalysis = async (base64Data: string) => {
+    setIsProcessing(true);
+    setScanResult(null);
+
+    try {
+      const result = await geminiService.parseReceiptImage(base64Data);
+      
+      if (result && result.number) {
+        handleManualFullCheck(result.number);
+      } else {
+        alert("無法辨識，請重試");
+      }
+    } catch (error) {
+      console.error("Scanning failed", error);
+      alert("分析失敗");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const base64 = await fileToBase64(file);
+      const base64Data = base64.split(',')[1]; 
+      await processImageAnalysis(base64Data);
+    } catch (error) {
+      alert("檔案處理失敗");
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = error => reject(error);
+    });
+  };
+
 
   // Manual Check
   const handleManualFullCheck = (num: string) => {
+    setScannedNumber(num);
     let prizeResult: CheckResult;
     if (periodIndex === -1) {
          const results = allLotteryData.map(data => checkLotteryNumber(num, data));
@@ -559,13 +566,13 @@ const App: React.FC = () => {
          prizeResult = checkLotteryNumber(num, winningNumbers);
     }
     setScanResult(prizeResult);
-    setScannedNumber(num);
 
-    // Voice Feedback for Manual Full Check
     if (prizeResult.isWinner) {
+        playBeep(1000, 'sine', 0.3);
         speakResult(`恭喜中獎，${prizeResult.prizeType}`);
         addRecord(prizeResult, num);
     } else {
+        playBeep(200, 'sawtooth', 0.2);
         speakResult("可惜沒中");
     }
   };
@@ -610,25 +617,13 @@ const App: React.FC = () => {
       alert("請輸入3碼數字");
       return;
     }
-    if (!selectedPendingPeriod) {
-      // Default to first available future period if not selected
-      if (futurePeriods.length > 0) {
-        // proceed with futurePeriods[0]
-      } else {
-         alert("請選擇期別");
-         return;
-      }
-    }
-
     const periodToUse = selectedPendingPeriod || futurePeriods[0];
-
     const newReceipt: PendingReceipt = {
       id: Date.now(),
       number: pendingInput,
       period: periodToUse,
       dateAdded: new Date().toLocaleDateString('zh-TW')
     };
-    
     setPendingReceipts([newReceipt, ...pendingReceipts]);
     setPendingInput("");
   };
@@ -638,16 +633,11 @@ const App: React.FC = () => {
     setPendingReceipts(updated);
   };
 
-  // Check if a pending receipt has now been drawn and if it won
   const checkPendingStatus = (receipt: PendingReceipt): { status: 'pending' | 'win' | 'lost', message: string } => {
-    // 1. Find if this period exists in our official data (use allLotteryData)
     const officialData = allLotteryData.find(d => d.period === receipt.period);
-    
     if (!officialData) {
       return { status: 'pending', message: '等待開獎' };
     }
-
-    // 2. Check logic
     const check = quickCheck3Digits(receipt.number, officialData);
     if (check.potential) {
       return { status: 'win', message: '注意！疑似中獎' };
@@ -659,11 +649,9 @@ const App: React.FC = () => {
 
   // --- Views ---
 
-  // 1. Checker View (對獎機)
+  // 1. Checker View
   const renderChecker = () => (
     <div className="flex flex-col h-full bg-white relative">
-      {/* ... existing checker UI ... */}
-      {/* Month Selector Overlay */}
       {isMonthSelectorOpen && (
         <div className="absolute inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm overflow-hidden animate-in fade-in zoom-in duration-200">
@@ -684,8 +672,6 @@ const App: React.FC = () => {
                   {periodIndex === idx && <Award size={20} />}
                 </button>
               ))}
-              
-              {/* 4 Months Option */}
               <button
                   onClick={() => {
                     setPeriodIndex(-1);
@@ -714,7 +700,6 @@ const App: React.FC = () => {
       {/* Top Input Area */}
       <div className="bg-[#eff5e9] border-[3px] border-primary rounded-xl m-4 p-6 text-center relative shadow-inner h-40 flex flex-col justify-center items-center transition-colors">
         
-        {/* Voice Input Toggle Button */}
         <button 
             onClick={toggleListening}
             className={`absolute right-2 top-2 flex items-center gap-2 px-3 py-1.5 rounded-full transition-all shadow-sm border ${isListening ? 'bg-red-50 border-red-200 text-red-600 ring-2 ring-red-100' : 'bg-white border-gray-200 text-gray-500 hover:bg-gray-50'}`}
@@ -735,7 +720,6 @@ const App: React.FC = () => {
           </div>
         )}
         
-        {/* Result Overlay */}
         {quickResult && (
             <div className={`absolute bottom-2 left-0 w-full text-center text-xl ${quickResult.potential ? 'text-red-600 font-bold animate-bounce' : 'text-gray-500'}`}>
                {quickResult.message}
@@ -804,7 +788,6 @@ const App: React.FC = () => {
           </button>
         ))}
         
-        {/* Month Button (Replaces Clear) */}
         <button
           onClick={() => setIsMonthSelectorOpen(true)}
           className="bg-yellow-500 hover:bg-yellow-600 active:scale-95 text-white text-lg font-bold rounded-lg shadow-[0_4px_0_0_#b45309] active:shadow-none active:translate-y-1 flex flex-col items-center justify-center transition-all"
@@ -830,9 +813,8 @@ const App: React.FC = () => {
     </div>
   );
 
-  // 2. List View (號碼單)
+  // 2. List View
   const renderList = () => {
-    // Helper to render numbers with last 3 highlighted
     const renderSplitNumber = (num: string) => {
         const head = num.slice(0, 5);
         const tail = num.slice(5);
@@ -848,7 +830,6 @@ const App: React.FC = () => {
 
     return (
         <div className="p-4 space-y-4 pb-24 max-w-2xl mx-auto">
-            {/* Period Selector in List View */}
             <div className="flex justify-center mb-2 overflow-x-auto">
                  <div className="bg-white rounded-lg shadow-sm p-1 inline-flex border border-gray-200">
                     {allLotteryData.map((data, idx) => (
@@ -874,7 +855,6 @@ const App: React.FC = () => {
                 </a>
             </div>
 
-            {/* Special Prize */}
             <div className="bg-[#eff5e9] rounded-xl p-4 flex flex-col md:flex-row items-start md:items-center justify-between border-l-4 border-primary shadow-sm">
                 <div className="mb-2 md:mb-0">
                     <div className="text-gray-800 font-bold mb-1">特別獎 <span className="font-mono text-3xl ml-2">{currentDisplayNumbers.specialPrize}</span></div>
@@ -882,7 +862,6 @@ const App: React.FC = () => {
                 </div>
             </div>
 
-            {/* Grand Prize */}
             <div className="bg-[#eff5e9] rounded-xl p-4 flex flex-col md:flex-row items-start md:items-center justify-between border-l-4 border-primary shadow-sm">
                 <div className="mb-2 md:mb-0">
                     <div className="text-gray-800 font-bold mb-1">特&nbsp;&nbsp;&nbsp;&nbsp;獎 <span className="font-mono text-3xl ml-2">{currentDisplayNumbers.grandPrize}</span></div>
@@ -890,7 +869,6 @@ const App: React.FC = () => {
                 </div>
             </div>
 
-            {/* First Prize Group */}
             <div className="bg-[#eff5e9] rounded-xl p-4 border-l-4 border-primary shadow-sm flex">
                 <div className="flex-1">
                     <div className="flex flex-col gap-2 mb-2">
@@ -911,7 +889,6 @@ const App: React.FC = () => {
                 </div>
             </div>
 
-            {/* Additional Sixth Prize */}
             <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-100 flex items-center">
                 <div className="w-16 font-bold text-gray-800">增開<br/>六獎</div>
                 <div className="flex-1 flex gap-4">
@@ -923,7 +900,6 @@ const App: React.FC = () => {
                 <div className="text-xs text-gray-500">末3位號碼相同:200元</div>
             </div>
 
-             {/* Quick Summary */}
             <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-100 text-center">
                <h3 className="font-bold text-gray-800 mb-4 text-lg">快速整理</h3>
                <div className="grid grid-cols-2 gap-4">
@@ -955,11 +931,10 @@ const App: React.FC = () => {
   const renderScanner = () => (
     <div className="flex flex-col items-center p-6 max-w-md mx-auto space-y-6">
       
-      {/* Camera Fullscreen Overlay */}
       {isCameraOpen && (
         <div className="fixed inset-0 bg-black z-50 flex flex-col">
           <div className="flex justify-between items-center p-4 bg-black/50 absolute top-0 left-0 right-0 z-10">
-            <span className="text-white font-medium">請將發票號碼對準框內</span>
+            <span className="text-white font-medium">請將發票 QR Code 或號碼對準框內</span>
             <button onClick={stopCamera} className="text-white p-2 rounded-full hover:bg-white/20">
               <X size={28} />
             </button>
@@ -970,11 +945,11 @@ const App: React.FC = () => {
              <canvas ref={canvasRef} className="hidden" />
              
              {/* Scanning Frame Guide */}
-             <div className="relative w-64 h-32 border-2 border-primary shadow-[0_0_0_999px_rgba(0,0,0,0.7)] rounded-lg">
-                <div className="absolute top-0 left-0 w-4 h-4 border-t-4 border-l-4 border-primary -mt-1 -ml-1"></div>
-                <div className="absolute top-0 right-0 w-4 h-4 border-t-4 border-r-4 border-primary -mt-1 -mr-1"></div>
-                <div className="absolute bottom-0 left-0 w-4 h-4 border-b-4 border-l-4 border-primary -mb-1 -ml-1"></div>
-                <div className="absolute bottom-0 right-0 w-4 h-4 border-b-4 border-r-4 border-primary -mb-1 -mr-1"></div>
+             <div className="relative w-64 h-64 border-2 border-primary shadow-[0_0_0_999px_rgba(0,0,0,0.7)] rounded-lg">
+                <div className="absolute top-0 left-0 w-8 h-8 border-t-4 border-l-4 border-primary -mt-1 -ml-1"></div>
+                <div className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-primary -mt-1 -mr-1"></div>
+                <div className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-primary -mb-1 -ml-1"></div>
+                <div className="absolute bottom-0 right-0 w-8 h-8 border-b-4 border-r-4 border-primary -mb-1 -mr-1"></div>
                 {/* Moving Line */}
                 <div className="absolute top-0 left-0 w-full h-0.5 bg-primary shadow-[0_0_10px_#78A843] animate-[scan_2s_ease-in-out_infinite]"></div>
              </div>
@@ -1014,7 +989,6 @@ const App: React.FC = () => {
         </label>
       </div>
 
-      {/* Processing State */}
       {isProcessing && (
          <div className="fixed inset-0 bg-black/50 z-40 flex flex-col items-center justify-center">
             <div className="bg-white p-6 rounded-xl flex flex-col items-center shadow-2xl">
@@ -1065,10 +1039,9 @@ const App: React.FC = () => {
     </div>
   );
 
-  // 4. History View (Modified to include Pending)
+  // 4. History View
   const renderHistory = () => (
     <div className="p-4 max-w-2xl mx-auto pb-24">
-      {/* Sub-Tabs Switcher */}
       <div className="flex justify-center mb-6">
         <div className="bg-gray-200 p-1 rounded-lg inline-flex">
           <button
@@ -1095,7 +1068,6 @@ const App: React.FC = () => {
       </div>
 
       {historySubTab === 'winning' ? (
-        // --- Winning History List ---
         <>
           <div className="flex justify-between items-center mb-4">
             <h2 className="text-xl font-bold text-gray-800 flex items-center">
@@ -1132,9 +1104,7 @@ const App: React.FC = () => {
           )}
         </>
       ) : (
-        // --- Pending Receipts View ---
         <>
-          {/* Add Pending Input */}
           <div className="bg-white rounded-xl p-5 shadow-sm border border-gray-200 mb-6">
              <h3 className="font-bold text-gray-800 mb-3 flex items-center">
                <Clock size={18} className="mr-2 text-primary" /> 預存下期發票
@@ -1181,7 +1151,7 @@ const App: React.FC = () => {
                 pendingReceipts.map((receipt) => {
                    const check = checkPendingStatus(receipt);
                    
-                   let cardClass = "border-l-4 border-gray-300 bg-white opacity-80"; // Lost/Gray
+                   let cardClass = "border-l-4 border-gray-300 bg-white opacity-80"; 
                    let statusColor = "text-gray-500";
                    let StatusIcon = X;
 
@@ -1226,7 +1196,6 @@ const App: React.FC = () => {
       
       {/* Top Header */}
       <div className="bg-primary text-white shadow-md z-20">
-         {/* Main Bar */}
          <div className="flex items-center justify-between px-4 h-12">
             <ChevronLeft size={24} className="cursor-pointer" />
             <h1 className="text-lg font-medium">
@@ -1244,7 +1213,6 @@ const App: React.FC = () => {
             </div>
          </div>
 
-         {/* Navigation Tabs */}
          <div className="flex text-sm font-medium overflow-x-auto no-scrollbar">
             <button 
               onClick={() => setActiveTab(Tab.Checker)}
@@ -1270,7 +1238,6 @@ const App: React.FC = () => {
             >
               設定
             </button>
-            {/* Added History Tab */}
             <button 
               onClick={() => setActiveTab(Tab.History)}
               className={`flex-1 min-w-[20%] py-3 text-center border-b-4 transition-colors whitespace-nowrap ${activeTab === Tab.History ? 'border-yellow-400 text-white' : 'border-transparent text-primary-light hover:text-white hover:bg-primary-dark'}`}
@@ -1280,7 +1247,6 @@ const App: React.FC = () => {
          </div>
       </div>
 
-      {/* Main Content */}
       <main className="flex-1 overflow-y-auto">
         {activeTab === Tab.Checker && renderChecker()}
         {activeTab === Tab.List && renderList()}
