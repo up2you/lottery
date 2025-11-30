@@ -4,31 +4,48 @@ import { WinningNumbers } from '../types';
 const API_BASE_URL = "https://api.einvoice.nat.gov.tw/PB2CAPIVAN/invapp/InvApp";
 
 // 雲端靜態檔案位置
-// 部署後，請將 USERNAME 和 REPO 換成您的資訊
-// 例如: https://raw.githubusercontent.com/your-name/invoice-master/main/public/lottery-data.json
-// 或者使用 GitHub Pages: https://your-name.github.io/invoice-master/lottery-data.json
-const CLOUD_DATA_URL = "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO_NAME/main/public/lottery-data.json";
+// 使用 raw.githubusercontent.com 直接訪問檔案（推薦，更可靠）
+// 或者使用 GitHub Pages: https://up2you.github.io/lottery/lottery-data.json
+const CLOUD_DATA_URL = "https://raw.githubusercontent.com/up2you/lottery/main/public/lottery-data.json";
 
 /**
  * 從雲端 (GitHub) 抓取預先產生好的 JSON 檔
  */
 export const fetchWinningNumbersFromCloud = async (): Promise<WinningNumbers[] | null> => {
-  console.log("[LotteryService] Checking for cloud updates...");
+  console.log("[LotteryService] Checking for cloud updates...", CLOUD_DATA_URL);
   try {
-    const response = await fetch(CLOUD_DATA_URL + "?t=" + new Date().getTime()); // Add timestamp to prevent caching
+    const response = await fetch(CLOUD_DATA_URL + "?t=" + new Date().getTime(), {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+      },
+      // 在 Capacitor 環境中可能需要這個
+      cache: 'no-cache'
+    });
+    
+    console.log("[LotteryService] Response status:", response.status, response.statusText);
+    
     if (!response.ok) {
-       console.warn("Cloud data not found or accessible.");
+       console.warn(`Cloud data not found or accessible. Status: ${response.status}`);
        return null;
     }
+    
     const data = await response.json();
+    console.log("[LotteryService] Received data:", data);
     
     if (Array.isArray(data) && data.length > 0 && data[0].period) {
        console.log("[LotteryService] Cloud data loaded successfully.", data[0].period);
        return data as WinningNumbers[];
     }
+    
+    console.warn("[LotteryService] Invalid data format");
     return null;
   } catch (error) {
-    console.warn("[LotteryService] Cloud fetch failed:", error);
+    console.error("[LotteryService] Cloud fetch failed:", error);
+    // 顯示更詳細的錯誤資訊
+    if (error instanceof TypeError && error.message.includes('Failed to fetch')) {
+      console.error("可能是 CORS 問題或網路連線問題");
+    }
     return null;
   }
 };

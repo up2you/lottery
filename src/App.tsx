@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Camera, Share2, RefreshCw, ChevronLeft, Award, Delete, Calendar, Layers, Mic, MicOff, X, Image as ImageIcon, Clock, PlusCircle, AlertCircle, CheckCircle2 } from 'lucide-react';
 import jsQR from 'jsqr';
+import { Capacitor } from '@capacitor/core';
 import { SpeechRecognition } from '@capacitor-community/speech-recognition';
 import { WinningNumbers, CheckResult, WinningRecord, PendingReceipt } from './types';
 import { checkLotteryNumber, quickCheck3Digits } from './utils/lotteryLogic';
@@ -305,19 +306,40 @@ const App: React.FC = () => {
   }, []);
 
   const toggleListening = async () => {
-      const { available } = await SpeechRecognition.available();
-      if (!available) {
-          alert("此裝置不支援語音輸入功能");
+      // 檢查是否在原生平台
+      if (!Capacitor.isNativePlatform()) {
+          alert("語音輸入功能僅在手機 App 中可用");
           return;
       }
 
-      if (isListening) {
-          await SpeechRecognition.stop();
-          setIsListening(false);
-      } else {
-          try {
-              // Request permission first
-              await SpeechRecognition.requestPermissions();
+      try {
+          const { available } = await SpeechRecognition.available();
+          if (!available) {
+              alert("此裝置不支援語音輸入功能");
+              return;
+          }
+
+          if (isListening) {
+              try {
+                  await SpeechRecognition.stop();
+                  setIsListening(false);
+              } catch (e) {
+                  console.error("Stop failed", e);
+                  setIsListening(false);
+              }
+          } else {
+              // 先檢查權限狀態
+              const permissionResult = await SpeechRecognition.checkPermissions();
+              
+              if (permissionResult.speechRecognition !== 'granted') {
+                  // 請求權限
+                  const requestResult = await SpeechRecognition.requestPermissions();
+                  if (requestResult.speechRecognition !== 'granted') {
+                      alert("需要麥克風權限才能使用語音輸入");
+                      return;
+                  }
+              }
+
               setIsListening(true);
               
               // Start listening
@@ -328,11 +350,11 @@ const App: React.FC = () => {
                   partialResults: true,
                   popup: false,
               });
-          } catch (e) {
-              console.error("Voice start failed", e);
-              setIsListening(false);
-              alert("語音啟動失敗，請檢查權限");
           }
+      } catch (e) {
+          console.error("Voice operation failed", e);
+          setIsListening(false);
+          alert(`語音功能錯誤：${e instanceof Error ? e.message : '未知錯誤'}`);
       }
   };
 
@@ -408,32 +430,61 @@ const App: React.FC = () => {
           const video = videoRef.current;
           const canvas = canvasRef.current;
           
-          if (video.readyState === video.HAVE_ENOUGH_DATA) {
-              canvas.width = video.videoWidth;
-              canvas.height = video.videoHeight;
-              const ctx = canvas.getContext("2d", { willReadFrequently: true });
+          if (video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0 && video.videoHeight > 0) {
+              // 確保 canvas 尺寸與 video 一致
+              const videoWidth = video.videoWidth;
+              const videoHeight = video.videoHeight;
+              
+              if (canvas.width !== videoWidth || canvas.height !== videoHeight) {
+                  canvas.width = videoWidth;
+                  canvas.height = videoHeight;
+              }
+              
+              const ctx = canvas.getContext("2d", { 
+                  willReadFrequently: true,
+                  alpha: false  // 提升效能
+              });
+              
               if (ctx) {
+                  // 繪製 video 到 canvas
                   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                  
+                  // 獲取圖像數據
                   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
                   
-                  // QR Scan
-                  const code = jsQR(imageData.data, imageData.width, imageData.height, {
-                      inversionAttempts: "dontInvert",
-                  });
+                  // QR Scan - 調整參數以提升辨識率
+                  const code = jsQR(
+                      imageData.data, 
+                      imageData.width, 
+                      imageData.height,
+                      {
+                          inversionAttempts: "attemptBoth"  // 嘗試兩種反轉
+                      }
+                  );
 
                   if (code && code.data) {
+                      console.log("QR Code detected:", code.data); // 除錯用
                       const matched = code.data.match(/[A-Z]{2}(\d{8})/);
                       if (matched && matched[1]) {
                           const num = matched[1];
                           // Only update if different to avoid spam
                           if (num !== scannedNumber) {
-                              playBeep(1500, 'square', 0.1); // Scan success sound
+                              playBeep(1500, 'square', 0.1);
                               handleManualFullCheck(num);
+                          }
+                      } else {
+                          // 如果不是發票格式，也嘗試直接提取 8 位數字
+                          const digitsOnly = code.data.replace(/\D/g, '');
+                          if (digitsOnly.length === 8 && digitsOnly !== scannedNumber) {
+                              console.log("Extracted 8 digits:", digitsOnly);
+                              playBeep(1500, 'square', 0.1);
+                              handleManualFullCheck(digitsOnly);
                           }
                       }
                   }
               }
           }
+          // 使用 requestAnimationFrame 維持掃描迴圈
           animationFrameRef.current = requestAnimationFrame(tickCamera);
       }
   };
